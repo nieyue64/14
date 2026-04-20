@@ -4996,47 +4996,11 @@ window.TU = window.TU || {};
     }
   }
 
-  /**
-   * @function runAsync
-   * @description Async-aware version of run() - catches both sync throws AND Promise rejections.
-   * Prevents silent async failures (Worker hangs, IDB write failures, etc.)
-   * @param {string} tag - Context label for error reporting
-   * @param {Function} fn - Async function to execute
-   * @param {Object} opts - Options: level, toastMessage, toastKey, cooldownMs, rethrow, fallback
-   * @returns {Promise<*>} Result of fn() or opts.fallback on error
-   */
-  async function runAsync(tag, fn, opts) {
-    try {
-      return await fn();
-    } catch (e) {
-      const o = opts || {};
-      const level = o.level || "error";
-      const entry = { tag: tag || "unknown", error: e, at: Date.now(), async: true };
-      errors.push(entry);
-      errors.length > maxErrors && errors.splice(0, errors.length - maxErrors);
-      try {
-        log(level, "[async] " + tag, e);
-      } catch(_ignored){}
-      // Report to GlobalErrorBoundary if available
-      try {
-        if (window.TU_Defensive && window.TU_Defensive.ErrorReporter) {
-          window.TU_Defensive.ErrorReporter.report(e, { phase: "async", source: tag });
-        }
-      } catch(_ignored){}
-      if (o.toastMessage) toast(o.toastMessage, o.toastMs, o.toastKey || tag, o.cooldownMs);
-      if (o.rethrow) throw e;
-      return o.fallback;
-    }
-  }
-
   TU.Safe = {
     run,
-    runAsync,
     toast,
     shouldFire,
-    errors,
-    /** @returns {Array} Recent errors for diagnostics */
-    getRecentErrors() { return errors.slice(-20); }
+    errors
   };
 })();
 document.getElementById('error-toggle')?.addEventListener('click', function() {
@@ -5163,32 +5127,18 @@ window.AppServices = new class ServiceLocator {
         try {
           return localStorage.getItem(k);
         } catch (e) {
-          console.warn('[Storage.get] failed for key:', k, e);
           return null;
         }
       },
       set: (k, v) => {
         try {
           localStorage.setItem(k, v);
-        } catch (e) {
-          // Explicitly surface QuotaExceededError instead of swallowing
-          if (e && e.name === 'QuotaExceededError') {
-            console.error('[Storage.set] QUOTA EXCEEDED for key:', k, '- data size:', (v||'').length);
-            try {
-              window.GameEvents && window.GameEvents.emit && window.GameEvents.emit("ui:toast", "⚠️ 存储空间不足，请清理浏览器数据", 3000);
-            } catch(_){}
-          } else {
-            console.error('[Storage.set] failed for key:', k, e);
-          }
-          throw e; // Re-throw so callers can handle it
-        }
+        } catch(e){console.warn('[Catch]',e);}
       },
       remove: k => {
         try {
           window.localStorage.removeItem(k);
-        } catch (e) {
-          console.warn('[Storage.remove] failed for key:', k, e);
-        }
+        } catch(e){console.warn('[Catch]',e);}
       }
     });
     this.register("session", {
@@ -5448,208 +5398,54 @@ window.Events = {
   once: function(event, cb, opts) { return window.GameEvents.once(event, cb, opts); }
 };
 
-// --- TU Canvas State Optimizer (Scoped to Game Canvas) ---
-// [Phase 0] Replaced global HTMLCanvasElement.prototype.getContext hijack with
-// a scoped CanvasOptimizer that only applies to the game's main canvas.
-// This prevents interference with other canvases (minimap, offscreen chunks, weather FX).
-window.TU_CanvasOptimizer = {
-  /**
-   * @method optimize
-   * @description Apply state-caching optimization to a specific canvas context.
-   * Only call this on the main game canvas context.
-   * @param {CanvasRenderingContext2D} ctx - The 2D context to optimize
-   * @returns {CanvasRenderingContext2D} The optimized context
-   */
-  optimize(ctx) {
-    if (!ctx || ctx.__tu_optimized) return ctx;
-    ctx.__tu_optimized = true;
-    let currentAlpha = 1, currentFill = "#000000";
-    Object.defineProperty(ctx, "globalAlpha", {
-      get() { return currentAlpha; },
-      set(val) {
-        currentAlpha !== val && (currentAlpha = val,
-        Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "globalAlpha").set.call(this, val));
-      }
-    });
-    Object.defineProperty(ctx, "fillStyle", {
-      get() { return currentFill; },
-      set(val) {
-        currentFill !== val && (currentFill = val,
-        Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "fillStyle").set.call(this, val));
-      }
-    });
-    const origSave = ctx.save, origRestore = ctx.restore, stateStack = [];
-    ctx.save = function () {
-      stateStack.push({ alpha: currentAlpha, fill: currentFill });
-      origSave.call(this);
-    };
-    ctx.restore = function () {
-      const state = stateStack.pop();
-      if (state) { currentAlpha = state.alpha; currentFill = state.fill; }
-      origRestore.call(this);
-    };
-    return ctx;
-  }
-};
-// ------------------------------------------
-// === [Phase 0] GlobalErrorBoundary & PerformanceBaseline ===
-(function() {
-  'use strict';
-  const TU = window.TU || (window.TU = {});
-
-  /**
-   * @class GlobalErrorBoundary
-   * @description Catches and surfaces fatal errors that were previously swallowed.
-   * Monitors: Worker hangs, audio context failures, IDB write failures, save corruption.
-   * Replaces the scattered try/catch(e){} anti-pattern with centralized error routing.
-   */
-  TU.GlobalErrorBoundary = {
-    _fatalCount: 0,
-    _warningCount: 0,
-    _maxFatals: 5,
-    _suppressUntil: 0,
-
-    /**
-     * @method reportFatal
-     * @description Report a fatal error that should NOT be silenced
-     * @param {string} source - Error origin (e.g. 'IDB.set', 'Worker.generate')
-     * @param {Error} error - The error object
-     * @param {Object} meta - Additional context
-     */
-    reportFatal(source, error, meta) {
-      this._fatalCount++;
-      const msg = '[FATAL:' + source + '] ' + (error && error.message || error);
-      console.error(msg, error, meta || '');
-      // Route to error dialog if available
-      try {
-        if (window.TU_Defensive && window.TU_Defensive.ErrorReporter) {
-          window.TU_Defensive.ErrorReporter.report(error, {
-            phase: 'runtime', source: source, details: JSON.stringify(meta || {})
-          });
+// --- TU Canvas State Optimizer Injected ---
+!function () {
+  const originalGetContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, options) {
+    const ctx = originalGetContext.call(this, type, options);
+    if ("2d" === type && ctx && !ctx.__tu_optimized) {
+      ctx.__tu_optimized = !0;
+      let currentAlpha = 1,
+        currentFill = "#000000";
+      // Override setters to prevent redundant calls to C++ bindings
+      Object.defineProperty(ctx, "globalAlpha", {
+        get: function () {
+          return currentAlpha;
+        },
+        set: function (val) {
+          currentAlpha !== val && (currentAlpha = val,
+          // Use internal setter
+          Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "globalAlpha").set.call(this, val));
         }
-      } catch(_){}
-      // Emit fatal event if threshold exceeded
-      if (this._fatalCount >= this._maxFatals) {
-        try {
-          window.GameEvents && window.GameEvents.emit('fatal:error', { source, msg, count: this._fatalCount });
-        } catch(_){}
-      }
-    },
-
-    /**
-     * @method reportWarning
-     * @description Report a non-fatal but concerning condition
-     */
-    reportWarning(source, message, meta) {
-      this._warningCount++;
-      const now = performance.now();
-      if (now < this._suppressUntil) return;
-      console.warn('[WARN:' + source + '] ' + message, meta || '');
-      // Rate-limit warnings to prevent console spam
-      if (this._warningCount > 50) {
-        this._suppressUntil = now + 5000;
-        this._warningCount = 0;
-      }
-    },
-
-    /** @method getStats */
-    getStats() {
-      return { fatals: this._fatalCount, warnings: this._warningCount };
-    }
-  };
-
-  /**
-   * @class PerformanceBaseline
-   * @description Tracks p95/p99 frame time and tick time for regression detection.
-   * Collects rolling window of frame durations to detect JIT deoptimization.
-   */
-  TU.PerformanceBaseline = {
-    _frameTimes: new Float32Array(300), // Rolling buffer of last 300 frame times
-    _tickTimes: new Float32Array(300),  // Rolling buffer of last 300 tick times
-    _frameIdx: 0,
-    _tickIdx: 0,
-    _frameCount: 0,
-    _tickCount: 0,
-    _lastFrameStart: 0,
-    _enabled: true,
-
-    /** Record a frame time sample (ms) */
-    recordFrame(ms) {
-      if (!this._enabled) return;
-      this._frameTimes[this._frameIdx % 300] = ms;
-      this._frameIdx++;
-      this._frameCount++;
-    },
-
-    /** Record a tick/update time sample (ms) */
-    recordTick(ms) {
-      if (!this._enabled) return;
-      this._tickTimes[this._tickIdx % 300] = ms;
-      this._tickIdx++;
-      this._tickCount++;
-    },
-
-    /** Calculate percentile from a rolling buffer */
-    _percentile(buf, count, pct) {
-      const n = Math.min(count, 300);
-      if (n < 10) return 0;
-      const sorted = Array.from(buf.subarray(0, n)).sort((a, b) => a - b);
-      const idx = Math.min(Math.floor(n * pct), n - 1);
-      return sorted[idx];
-    },
-
-    /** Get performance baseline snapshot */
-    getBaseline() {
-      return {
-        frameP50: this._percentile(this._frameTimes, this._frameCount, 0.50),
-        frameP95: this._percentile(this._frameTimes, this._frameCount, 0.95),
-        frameP99: this._percentile(this._frameTimes, this._frameCount, 0.99),
-        tickP50: this._percentile(this._tickTimes, this._tickCount, 0.50),
-        tickP95: this._percentile(this._tickTimes, this._tickCount, 0.95),
-        tickP99: this._percentile(this._tickTimes, this._tickCount, 0.99),
-        samples: { frames: Math.min(this._frameCount, 300), ticks: Math.min(this._tickCount, 300) }
+      });
+      Object.defineProperty(ctx, "fillStyle", {
+        get: function () {
+          return currentFill;
+        },
+        set: function (val) {
+          currentFill !== val && (currentFill = val, Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype, "fillStyle").set.call(this, val));
+        }
+      }); // Intercept save/restore to track state (optional, but complex, leaving alpha/fill is 80% of the gain)
+      const origSave = ctx.save,
+        origRestore = ctx.restore,
+        stateStack = [];
+      ctx.save = function () {
+        stateStack.push({
+          alpha: currentAlpha,
+          fill: currentFill
+        });
+        origSave.call(this);
       };
-    },
-
-    /** Print baseline to console */
-    report() {
-      const b = this.getBaseline();
-      console.log(
-        '[PerfBaseline] Frame p50/p95/p99: ' + b.frameP50.toFixed(2) + '/' + b.frameP95.toFixed(2) + '/' + b.frameP99.toFixed(2) + 'ms' +
-        ' | Tick p50/p95/p99: ' + b.tickP50.toFixed(2) + '/' + b.tickP95.toFixed(2) + '/' + b.tickP99.toFixed(2) + 'ms' +
-        ' (' + b.samples.frames + ' samples)'
-      );
-      return b;
+      ctx.restore = function () {
+        const state = stateStack.pop();
+        if (state) { currentAlpha = state.alpha; currentFill = state.fill; }
+        origRestore.call(this);
+      };
     }
+    return ctx;
   };
-
-  // Hook into game loop to collect baselines automatically
-  if (window.GameEvents) {
-    window.GameEvents.on('game:render:pre', () => {
-      TU.PerformanceBaseline._lastFrameStart = performance.now();
-    });
-    window.GameEvents.on('game:render:post', () => {
-      const start = TU.PerformanceBaseline._lastFrameStart;
-      if (start > 0) {
-        TU.PerformanceBaseline.recordFrame(performance.now() - start);
-      }
-    });
-    window.GameEvents.on('game:update', (dtMs) => {
-      // dtMs is the actual frame delta, record it as tick time
-      if (dtMs > 0 && dtMs < 200) {
-        TU.PerformanceBaseline.recordTick(dtMs);
-      }
-    });
-    // Auto-report every 30 seconds in debug mode
-    window.GameEvents.on('game:init:post', () => {
-      if (window.__TU_DEBUG__) {
-        setInterval(() => TU.PerformanceBaseline.report(), 30000);
-      }
-    });
-  }
-})();
-// === End GlobalErrorBoundary & PerformanceBaseline ===
-
+}();
+// ------------------------------------------
 let __tu_rand_idx = 0;
 const __TU_RAND_LUT = new Float32Array(16384);
 for (let i = 0; 16384 > i; i++) __TU_RAND_LUT[i] = Math.random();
@@ -18665,10 +18461,6 @@ class Renderer {
       this.ctx || (this.ctx = canvas.getContext("2d", {
         alpha: !1
       }));
-      // [Phase 0] Apply scoped canvas optimizer to main game canvas only
-      if (this.ctx && window.TU_CanvasOptimizer) {
-        window.TU_CanvasOptimizer.optimize(this.ctx);
-      }
       this.ctx.imageSmoothingEnabled = !1;
     }
     window.GameEvents.on('block:written', e => this.invalidateTile(e.x, e.y));
@@ -29093,11 +28885,14 @@ window.TU;
           AudioManager = TU.AudioManager;
         if (Game && Game.prototype && !Game.prototype.__tuGameReadyEvent) {
           Game.prototype.__tuGameReadyEvent = !0;
-          // [Phase 0 Fix] REMOVED duplicate game:init:post emission.
-          // The original Game.init() already emits 'game:init:post' at the end of initialization.
-          // This wrapper was causing double-trigger of all init:post listeners, leading to
-          // first-frame stutter spikes and duplicate state initialization.
-          // The __tuGameReadyEvent flag is kept to prevent other patches from re-wrapping.
+          const _init = Game.prototype.init;
+          "function" == typeof _init && (Game.prototype.init = async function (...args) {
+            const r = await _init.apply(this, args);
+            try {
+              window.GameEvents.emit("game:init:post", this);
+            } catch(e){console.warn('[Catch]',e);}
+            return r;
+          });
         }
         if (InputManager && InputManager.prototype && !InputManager.prototype.__tuInputSafety) {
           InputManager.prototype.__tuInputSafety = !0;
